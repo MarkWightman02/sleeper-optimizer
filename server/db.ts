@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AnalysisHistoryItem, AnalysisResult, AppConfig, MappingConfidence, SleeperPlayer } from '../shared/types.js';
+import { ANALYSIS_SCHEMA_VERSION, type AnalysisHistoryItem, type AnalysisResult, type AppConfig, type MappingConfidence, type SleeperPlayer } from '../shared/types.js';
 
 const dataDir = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 fs.mkdirSync(dataDir, { recursive: true });
@@ -91,7 +91,9 @@ export function saveAnalysis(result: AnalysisResult): void {
 
 export function getLatestAnalysis(): AnalysisResult | null {
   const row = db.prepare('SELECT value FROM analyses ORDER BY analyzed_at DESC LIMIT 1').get() as { value: string } | undefined;
-  return row ? JSON.parse(row.value) as AnalysisResult : null;
+  if (!row) return null;
+  const analysis = JSON.parse(row.value) as AnalysisResult;
+  return analysis.schemaVersion === ANALYSIS_SCHEMA_VERSION ? analysis : null;
 }
 
 export function listAnalysisHistory(limit = 10): AnalysisHistoryItem[] {
@@ -125,6 +127,13 @@ export function putProviderCache(source: string, cacheKey: string, value: unknow
     ON CONFLICT(source, cache_key) DO UPDATE SET season=excluded.season, week=excluded.week, value=excluded.value, retrieved_at=excluded.retrieved_at`)
     .run(source, cacheKey, season || null, week ?? null, JSON.stringify(value), retrievedAt);
   return retrievedAt;
+}
+
+/** Drops superseded nflverse cache entries (pre-v2 stored every raw CSV column) and reclaims the space. */
+export function pruneLegacyNflverseCache(): number {
+  const removed = db.prepare("DELETE FROM provider_cache WHERE source = 'nflverse' AND cache_key NOT LIKE '%#v2'").run().changes;
+  if (removed > 0) db.exec('VACUUM');
+  return removed;
 }
 
 export function clearProviderCache(source?: string): void {

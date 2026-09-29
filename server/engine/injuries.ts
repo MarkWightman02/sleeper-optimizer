@@ -2,6 +2,7 @@ import type { NormalizedInjuryStatus, SleeperPlayer } from '../../shared/types.j
 
 export interface NflverseInjuryRow {
   gsis_id: string;
+  week?: string;
   report_status?: string | null;
   report_primary_injury?: string | null;
   practice_status?: string | null;

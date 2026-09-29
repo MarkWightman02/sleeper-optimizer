@@ -38,6 +38,8 @@ export interface ExternalPlayerData {
   probabilityOfPlaying?: number | null;
   scoringComponents?: ScoringComponent[];
   unsupportedScoringKeys?: string[];
+  /** Why no projection exists for this player this week (never treated as 0). */
+  missingReason?: string | null;
   rawWeeklyStats?: Record<string, number | null | undefined>;
   projections?: ProjectionValue[];
   rankings?: RankingValue[];
@@ -95,5 +97,7 @@ export interface SourceOutcome {
   status: 'SUCCESS' | 'FAILED' | 'TIMEOUT' | 'PARSE_ERROR' | 'BLOCKED';
   detail?: string;
   retrievedAt: string | null;
+  /** The source's own publication/update time when it exposes a trustworthy one (e.g. nflverse `last-modified`). */
+  sourceUpdatedAt?: string | null;
   stale?: boolean;
 }

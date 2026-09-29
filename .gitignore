@@ -1,7 +1,47 @@
+# Dependencies and build output
 node_modules/
 dist/
 dist-server/
-data/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Environment and secrets (keep .env.example tracked)
 .env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Runtime data, databases and caches
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.cache/
+cache/
+tmp/
+temp/
+*.tmp
+
+# Logs and dumps
+logs/
 *.log
+npm-debug.log*
+*.dump
+*.sql.gz
+
+# Local Docker data
+docker-data/
+.docker/
+docker-compose.override.yml
+
+# Editor, OS and assistant files
+.claude/
+.vscode/
+.idea/
+*.swp
 .DS_Store
+Thumbs.db

@@ -94,3 +94,23 @@ describe('week-consistent supporting data', () => {
     expect(ctx(4).injuriesByGsis.get('G1')?.report_status).toBe('Out');
   });
 });
+
+describe('team-code and depth-chart hygiene', () => {
+  const game = (home: string, away: string) => ({ game_id: 'g', season: '2026', week: '4', gameday: '2026-10-04', gametime: '13:00', home_team: home, away_team: away });
+
+  it('joins nflverse (JAX, LA) and Sleeper (JAX, LAR) team codes in both directions', () => {
+    const ctx = buildSupportingContext('2026', 4, [game('JAX', 'LA')], [], [], [], []);
+    expect(ctx.scheduleByTeam.get('JAC')?.opponent).toBe('LAR');
+    expect(ctx.scheduleByTeam.get('LAR')?.opponent).toBe('JAX');
+    expect(ctx.scheduleByTeam.get('JAC')?.gameTime).toBe('2026-10-04T17:00:00.000Z');
+  });
+
+  it('ignores depth-chart snapshots older than the freshness window and keeps the latest snapshot per player', () => {
+    const row = (dt: string, pos_rank: string) => ({ team: 'BUF', player_name: 'X', espn_id: '1', gsis_id: 'G9', pos_abb: 'WR', pos_rank, dt });
+    const now = new Date('2026-09-29T12:00:00Z');
+    const ctx = buildSupportingContext('2026', 4, [], [row('2026-09-01T00:00:00Z', '1'), row('2026-09-27T00:00:00Z', '2'), row('2026-09-20T00:00:00Z', '3')], [], [], [], now);
+    expect(ctx.depthByGsis.get('G9')?.pos_rank).toBe('2');
+    const stale = buildSupportingContext('2026', 4, [], [row('2026-09-01T00:00:00Z', '1')], [], [], [], now);
+    expect(stale.depthByGsis.has('G9')).toBe(false);
+  });
+});

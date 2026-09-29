@@ -1,7 +1,7 @@
-import type { NewsItem, RankingValue, SupportingDataPoint } from '../../shared/types.js';
+import type { NewsItem, ProjectionValue, RankingValue, SupportingDataPoint } from '../../shared/types.js';
 import { getProviderCache, putProviderCache } from '../db.js';
 import { scoreEspnProjection, type EspnStatLine } from '../engine/scoring.js';
-import { normalizeTeam } from '../services/player-mapping.js';
+import { sleeperTeamCode } from '../services/player-mapping.js';
 import { STALE_FALLBACK_DETAIL, VOLATILE_MAX_AGE_MS } from './freshness.js';
 import type { ExternalPlayerData, SourceOutcome } from './types.js';
 
@@ -17,7 +17,10 @@ const PRO_TEAM: Record<number, string> = {
 };
 const POSITION: Record<number, string> = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'DEF' };
 
-interface EspnStatEntry { scoringPeriodId: number; seasonId: number; statSourceId: number; stats: Record<string, number> }
+/** ESPN fantasy `slotId` for each position; ranks are only comparable within the player's own position slot. */
+const POSITION_SLOT: Record<string, number> = { QB: 0, RB: 2, WR: 4, TE: 6, K: 17, DEF: 16 };
+
+interface EspnStatEntry { scoringPeriodId: number; seasonId: number; statSourceId: number; statSplitTypeId?: number; stats?: Record<string, number> }
 interface EspnRankEntry { rank: number; rankType: string; rankSourceId: number; slotId: number }
 interface EspnPlayerRow {
   id: number;
@@ -60,11 +63,40 @@ async function fetchPlayers(season: string, week: number, forceRefresh: boolean)
   } finally { clearTimeout(timer); }
 }
 
+export interface EspnUnmatched { espnId: string; name: string; team: string | null; position: string; points: number }
+
 export interface EspnResult {
   data: Map<string, ExternalPlayerData>;
+  /** ESPN players that carry a real projection but could not be joined to any Sleeper player (a missed mapping, not a missing projection). */
+  unmatchedProjected: EspnUnmatched[];
   rankings: Map<string, RankingValue[]>;
   news: Map<string, NewsItem[]>;
   outcome: SourceOutcome;
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((x, y) => x - y);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/** ESPN publishes one rank per expert (rankSourceId) per rank type and position slot; collapse to one source-level ranking. */
+export function aggregateEspnRankings(entries: EspnRankEntry[], position: string, rankType: 'PPR' | 'STANDARD', week: number, retrievedAt: string | null, stale: boolean): RankingValue | null {
+  const slot = POSITION_SLOT[position];
+  if (slot == null) return null;
+  const perExpert = new Map<number, number>();
+  for (const entry of entries) if (entry.slotId === slot && entry.rankType === rankType && Number.isFinite(entry.rank) && entry.rank > 0) perExpert.set(entry.rankSourceId, entry.rank);
+  if (!perExpert.size) return null;
+  const ranks = [...perExpert.values()];
+  return {
+    source: `${SOURCE} expert rankings`, positionRank: Math.round(median(ranks)), overallRank: null, scoringType: rankType, retrievedAt, week,
+    expertCount: ranks.length, rankMin: Math.min(...ranks), rankMax: Math.max(...ranks), ...(stale ? { stale: true } : {})
+  };
+}
+
+/** The single ESPN entry that is a weekly projection: statSourceId 1 (projection; 0 is actual), single-period split, exact week and season. */
+export function findWeeklyProjection(stats: EspnStatEntry[] | undefined, season: number, week: number): EspnStatEntry | undefined {
+  return stats?.find(entry => entry.scoringPeriodId === week && entry.seasonId === season && entry.statSourceId === 1 && (entry.statSplitTypeId ?? 1) === 1);
 }
 
 export async function loadEspnProjections(
@@ -73,27 +105,41 @@ export async function loadEspnProjections(
   const { rows, outcome } = await fetchPlayers(season, week, forceRefresh);
   const data = new Map<string, ExternalPlayerData>();
   const rankings = new Map<string, RankingValue[]>();
-  const scoringType = (scoring.rec || 0) > 0 ? 'PPR' : 'STANDARD';
+  const unmatchedProjected: EspnUnmatched[] = [];
+  const scoringPpr = scoring.rec ?? 0;
+  const rankType: 'PPR' | 'STANDARD' = scoringPpr > 0 ? 'PPR' : 'STANDARD';
+  const stale = Boolean(outcome.stale);
 
   for (const row of rows) {
     const position = POSITION[row.defaultPositionId ?? -1];
     if (!position) continue;
     const team = PRO_TEAM[row.proTeamId ?? -1] || null;
     // Team defenses have no person-level identity in the crosswalk; Sleeper's own DEF player_id is the team code.
-    const sleeperId = position === 'DEF' ? (team ? normalizeTeam(team) : null) : espnIdToSleeperId.get(String(row.id));
-    if (!sleeperId) continue;
+    const sleeperId = position === 'DEF' ? (team ? sleeperTeamCode(team) : null) : espnIdToSleeperId.get(String(row.id));
+    const weeklyEntry = findWeeklyProjection(row.stats, Number(season), week);
+    const scored = weeklyEntry ? scoreEspnProjection((weeklyEntry.stats || {}) as EspnStatLine, scoring, position) : null;
+    if (!sleeperId) {
+      if (scored?.points != null && team) unmatchedProjected.push({ espnId: String(row.id), name: row.fullName || String(row.id), team, position, points: scored.points });
+      continue;
+    }
+    const missingReason = !weeklyEntry ? 'ESPN published no weekly projection entry for this player and week.' : scored?.points == null ? (scored?.reason || 'ESPN projection lacked the core statistics needed to score it.') : null;
 
-    const weeklyEntry = row.stats?.find(entry => entry.scoringPeriodId === week && entry.seasonId === Number(season) && entry.statSourceId === 1);
-    let projection: ReturnType<typeof scoreEspnProjection> | null = null;
-    if (weeklyEntry) projection = scoreEspnProjection(weeklyEntry.stats as EspnStatLine, scoring, position);
-
-    const weekRanks = row.rankings?.[String(week)] || [];
-    const relevantRanks = weekRanks.filter(rank => rank.rankType === scoringType || rank.rankType === 'STANDARD');
-    if (relevantRanks.length) rankings.set(sleeperId, relevantRanks.map((rank, index) => ({ source: relevantRanks.length > 1 ? `ESPN expert panel #${rank.rankSourceId}` : SOURCE, positionRank: rank.rank, overallRank: null, scoringType: rank.rankType, retrievedAt: outcome.retrievedAt })));
+    const ranking = aggregateEspnRankings(row.rankings?.[String(week)] || [], position, rankType, week, outcome.retrievedAt, stale);
+    if (ranking) rankings.set(sleeperId, [ranking]);
 
     const supportingData: SupportingDataPoint[] = [];
     if (row.ownership?.percentOwned != null) supportingData.push({ label: 'ESPN ownership', value: `Rostered in ${row.ownership.percentOwned.toFixed(1)}% of ESPN leagues`, source: SOURCE });
     if (row.ownership?.percentStarted != null) supportingData.push({ label: 'ESPN start rate', value: `Started in ${row.ownership.percentStarted.toFixed(1)}% of ESPN lineups`, source: SOURCE });
+
+    const projection: ProjectionValue | null = weeklyEntry && scored && scored.points != null ? {
+      source: SOURCE, points: scored.points, scoringComponents: scored.components, unsupportedScoringKeys: scored.unsupportedKeys, coverage: scored.coverage,
+      retrievedAt: outcome.retrievedAt, ...(stale ? { stale: true } : {}),
+      provenance: {
+        season: weeklyEntry.seasonId, week: weeklyEntry.scoringPeriodId, statSourceId: weeklyEntry.statSourceId, statSplitTypeId: weeklyEntry.statSplitTypeId ?? 1,
+        providerPlayerId: String(row.id), providerPlayerName: row.fullName || null, rawStatLine: scored.statLine,
+        omittedKeys: scored.omittedKeys, minorUnmodeledKeys: scored.minorUnmodeledKeys, approximations: scored.approximations
+      }
+    } : null;
 
     data.set(sleeperId, {
       sleeperId,
@@ -103,19 +149,20 @@ export async function loadEspnProjections(
       injuryStatus: row.injuryStatus && row.injuryStatus !== 'ACTIVE' ? row.injuryStatus : null,
       opponent: null,
       gameTime: null,
-      confidence: projection?.points != null ? (projection.coverage >= 80 ? 'High' : projection.coverage >= 50 ? 'Medium' : 'Low') : 'Low',
-      projectionCoverage: projection?.coverage ?? 0,
-      scoringComponents: projection?.components ?? [],
-      unsupportedScoringKeys: projection?.unsupportedKeys ?? [],
-      projections: projection?.points != null ? [{ source: SOURCE, points: projection.points, scoringComponents: projection.components, unsupportedScoringKeys: projection.unsupportedKeys, coverage: projection.coverage, retrievedAt: outcome.retrievedAt }] : [],
-      rankings: rankings.get(sleeperId) || [],
+      confidence: projection ? (projection.coverage! >= 80 ? 'High' : projection.coverage! >= 50 ? 'Medium' : 'Low') : 'Low',
+      projectionCoverage: scored?.coverage ?? 0,
+      scoringComponents: scored?.components ?? [],
+      unsupportedScoringKeys: scored?.unsupportedKeys ?? [],
+      missingReason,
+      projections: projection ? [projection] : [],
+      rankings: ranking ? [ranking] : [],
       supportingData,
       metrics: {
         projection: { value: projection?.points ?? null, source: SOURCE },
-        coverage: { value: projection?.coverage ?? null, source: 'Sleeper scoring × ESPN statistics' },
+        coverage: { value: scored?.coverage ?? null, source: 'Sleeper scoring × ESPN statistics' },
         ownership: { value: row.ownership?.percentOwned ?? null, source: SOURCE }
       }
     });
   }
-  return { data, rankings, news: new Map(), outcome };
+  return { data, unmatchedProjected, rankings, news: new Map(), outcome };
 }

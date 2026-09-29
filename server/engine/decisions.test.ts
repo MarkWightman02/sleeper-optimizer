@@ -17,7 +17,7 @@ function recommend(players: PlayerEvaluation[], positions = POSITIONS, currentId
   const byId = new Map(players.map(player => [player.playerId, player]));
   const current: LineupEntry[] = currentIds.map((id, index) => ({ slot: positions[index], player: byId.get(id) || null, changed: false, previousPlayerId: null }));
   const recommended = optimizeLineup(players.filter(player => player.eligible), positions, currentIds);
-  attachLineupDecisions(current, recommended, BAND, new Set());
+  attachLineupDecisions(current, recommended, BAND, new Map());
   return { current, recommended, ids: recommended.map(entry => entry.player?.playerId), decisions: recommended.flatMap(entry => entry.decision ? [entry.decision] : []) };
 }
 
@@ -48,9 +48,11 @@ describe('projection-first optimization', () => {
   it('correlation cannot override a large gap', () => {
     const players = roster({});
     players[1] = { ...players[1], team: 'BUF' };
-    players[2] = { ...players[2], team: 'KC' };
-    const opponent = [availabilityPlayer('their_qb', 'QB', 20, {}, { team: 'KC' })];
-    const bonus = correlationBonusMap(players, opponent, BAND);
+    const receiving = { providerStat: 'espn:53', projectedStat: null, sleeperKey: 'rec_yd', multiplier: null, projectedPoints: 8, modeled: true };
+    const passing = { providerStat: 'espn:3', projectedStat: null, sleeperKey: 'pass_yd', multiplier: null, projectedPoints: 12, modeled: true };
+    players[2] = { ...players[2], team: 'KC', scoringComponents: [receiving] };
+    const opponent = [availabilityPlayer('their_qb', 'QB', 20, {}, { team: 'KC', scoringComponents: [passing] })];
+    const bonus = correlationBonusMap(players, opponent, BAND, 'FAVORITE');
     expect(bonus.get('henderson')).toBeGreaterThan(0);
     const lineup = optimizeLineup(players, POSITIONS, [], bonus);
     expect(lineup.map(entry => entry.player?.playerId)).toContain('hall');

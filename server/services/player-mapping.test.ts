@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { SleeperPlayer } from '../../shared/types.js';
 import type { CrosswalkIndex, CrosswalkRow } from './crosswalk.js';
 import { deletePlayerMapping } from '../db.js';
-import { normalizePlayerName, normalizePosition, normalizeTeam, resolvePlayerIdentities } from './player-mapping.js';
+import { normalizePlayerName, normalizePosition, normalizeTeam, resolvePlayerIdentities, sleeperTeamCode } from './player-mapping.js';
 
 const created: string[] = [];
 afterEach(() => { for (const id of created.splice(0)) deletePlayerMapping('espn', id); });
@@ -28,6 +28,21 @@ describe('player identity mapping', () => {
     expect(normalizePlayerName("D'Andre Swift Jr.")).toBe('dandreswift');
     expect(normalizeTeam('JAX')).toBe('JAC');
     expect(normalizePosition('D/ST')).toBe('DEF');
+  });
+
+  it('reconciles crosswalk-style team and position codes (GBP, PK) with Sleeper\'s (GB, K)', () => {
+    expect(normalizeTeam('GBP')).toBe('GB');
+    expect(normalizeTeam('KCC')).toBe('KC');
+    expect(normalizePosition('PK')).toBe('K');
+    expect(sleeperTeamCode('JAC')).toBe('JAX');
+    expect(sleeperTeamCode('LA')).toBe('LAR');
+    expect(normalizeTeam(sleeperTeamCode('JAC'))).toBe(normalizeTeam('JAX'));
+    const sleepers: Record<string, SleeperPlayer> = { map_kicker_test: { player_id: 'map_kicker_test', full_name: 'Trey Smack', position: 'K', fantasy_positions: ['K'], team: 'GB', active: true } };
+    created.push('map_kicker_test');
+    const crosswalk = indexOf([row({ espn_id: '4869461', gsis_id: '00-0040899', name: 'Trey Smack', position: 'PK', team: 'GBP' })]);
+    const result = resolvePlayerIdentities(sleepers, crosswalk);
+    expect(result.bySleeperId.get('map_kicker_test')?.espnId).toBe('4869461');
+    expect(result.bySleeperId.get('map_kicker_test')?.method).toBe('name_team_position');
   });
 
   it('prefers the crosswalk\'s own sleeper_id join over anything else', () => {

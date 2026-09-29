@@ -1,4 +1,4 @@
-import type { AvailabilityAssessment, NewsItem, NewsSignal, NormalizedInjuryStatus, RiskFlag, SleeperPlayer } from '../../shared/types.js';
+import type { AvailabilityAssessment, AvailabilityEvidence, NewsItem, NewsSignal, NormalizedInjuryStatus, RiskFlag, SleeperPlayer } from '../../shared/types.js';
 import { BASE_PLAY_PROBABILITY, combineInjuryStatus, normalizeInjuryStatus, severity, type NflverseInjuryRow } from './injuries.js';
 
 /**
@@ -63,6 +63,12 @@ export function playProbability(status: NormalizedInjuryStatus, practice: 'full'
   return { value: base, policy: status === 'ACTIVE' ? 'No availability concern → 1.00 (normal projection-first optimization)' : `${status} → ${base.toFixed(2)}` };
 }
 
+/** News older than this (relative to now) is treated as history, not a current availability signal. */
+export const NEWS_MAX_AGE_DAYS = 6;
+/** A Sleeper Questionable/Doubtful label whose last update is older than this is probably a prior-week designation. */
+export const SLEEPER_DESIGNATION_MAX_AGE_DAYS = 8;
+const DAY_MS = 86_400_000;
+
 export interface AvailabilityInput {
   sleeper: SleeperPlayer | undefined;
   official?: NflverseInjuryRow;
@@ -70,9 +76,32 @@ export interface AvailabilityInput {
   sleeperRetrievedAt: string | null;
   sleeperStale: boolean;
   officialRetrievedAt: string | null;
+  /** nflverse's own `last-modified` for the injury report. */
+  officialSourceUpdatedAt?: string | null;
   officialStale: boolean;
   gameTime: string | null;
   now: Date;
+  targetWeek?: number;
+}
+
+/** Whether a news item can inform this week's availability; unusable items are kept as evidence with the reason. */
+export function newsUsability(item: NewsItem, now: Date, targetWeek?: number): { usable: boolean; note?: string } {
+  const published = item.publishedAt ? Date.parse(item.publishedAt) : NaN;
+  if (!Number.isFinite(published)) return { usable: false, note: 'No publication timestamp, so its freshness cannot be verified.' };
+  if (published > now.getTime() + 3_600_000) return { usable: false, note: 'Publication timestamp is in the future.' };
+  const ageDays = (now.getTime() - published) / DAY_MS;
+  if (ageDays > NEWS_MAX_AGE_DAYS) return { usable: false, note: `Published ${Math.floor(ageDays)} days ago (older than ${NEWS_MAX_AGE_DAYS}); treated as history.` };
+  if (targetWeek != null) {
+    const text = `${item.headline} ${item.summary || ''}`;
+    const weeks = [...text.matchAll(/\bweek\s*(\d{1,2})\b/gi)].map(match => Number(match[1]));
+    if (weeks.length && !weeks.includes(targetWeek)) return { usable: false, note: `Refers to Week ${weeks[0]}, not the target Week ${targetWeek}.` };
+  }
+  return { usable: true };
+}
+
+function sleeperUpdatedAt(player: SleeperPlayer | undefined): string | null {
+  const raw = player?.news_updated;
+  return raw ? new Date(raw > 10_000_000_000 ? raw : raw * 1000).toISOString() : null;
 }
 
 export function assessAvailability(input: AvailabilityInput): AvailabilityAssessment {
@@ -83,14 +112,49 @@ export function assessAvailability(input: AvailabilityInput): AvailabilityAssess
   const officialDrives = officialStatus != null && severity[officialStatus] >= severity[sleeperStatus] && officialStatus !== 'ACTIVE';
   const sleeperDrives = sleeperStatus !== 'ACTIVE' && severity[sleeperStatus] >= (officialStatus ? severity[officialStatus] : 0);
   const statusSource = officialDrives && sleeperDrives ? 'nflverse official injury report + Sleeper' : officialDrives ? 'nflverse official injury report' : 'Sleeper';
-  const statusUpdatedAt = officialDrives && !sleeperDrives ? input.officialRetrievedAt : combined.lastUpdated;
+  const officialPublishedAt = input.officialSourceUpdatedAt || null;
+  const sleeperPublishedAt = sleeperUpdatedAt(input.sleeper);
+  const statusUpdatedAt = officialDrives && !sleeperDrives ? (officialPublishedAt || input.officialRetrievedAt) : sleeperPublishedAt;
 
   const practice = combined.practice;
   const level = practiceLevel(practice);
-  const classified = input.news.map(item => ({ ...item, signal: classifyNews(item) }))
-    .sort((a, b) => Date.parse(b.publishedAt || '') - Date.parse(a.publishedAt || '') || 0);
-  const decisive = classified.find(item => item.signal !== 'neutral');
-  const latestNews = decisive || (status !== 'ACTIVE' ? classified[0] : undefined) || null;
+  const evidence: AvailabilityEvidence[] = [];
+  if (input.official?.report_status || input.official?.practice_status) {
+    evidence.push({
+      source: 'nflverse official injury report', kind: 'official-report',
+      detail: `${input.official.report_status || 'no game designation'}${input.official.report_primary_injury ? ` (${input.official.report_primary_injury})` : ''}${input.official.practice_status ? `; practice: ${input.official.practice_status}` : ''}`,
+      publishedAt: officialPublishedAt, retrievedAt: input.officialRetrievedAt, targetWeek: input.official.week ? Number(input.official.week) : (input.targetWeek ?? null), used: true
+    });
+  }
+  const sleeperLabel = input.sleeper?.injury_status || (sleeperStatus !== 'ACTIVE' ? input.sleeper?.status : null);
+  let sleeperPossiblyPriorWeek = false;
+  if (sleeperLabel) {
+    const ageDays = sleeperPublishedAt ? (input.now.getTime() - Date.parse(sleeperPublishedAt)) / DAY_MS : null;
+    sleeperPossiblyPriorWeek = (sleeperStatus === 'QUESTIONABLE' || sleeperStatus === 'DOUBTFUL') && !input.official?.report_status && ageDays != null && ageDays > SLEEPER_DESIGNATION_MAX_AGE_DAYS;
+    evidence.push({
+      source: 'Sleeper player status', kind: 'sleeper-status', detail: `${sleeperLabel}${input.sleeper?.injury_body_part ? ` (${input.sleeper.injury_body_part})` : ''}${input.sleeper?.practice_description ? `; practice: ${input.sleeper.practice_description}` : ''}`,
+      publishedAt: sleeperPublishedAt, retrievedAt: input.sleeperRetrievedAt, targetWeek: null, used: true,
+      note: sleeperPossiblyPriorWeek
+        ? `Last updated ${Math.floor(ageDays!)} days ago with no official report for Week ${input.targetWeek ?? '?'}: this may be a prior-week designation.`
+        : 'Sleeper statuses are current as of retrieval and not tagged with a week.'
+    });
+  }
+
+  const classified = input.news.map(item => {
+    const usability = newsUsability(item, input.now, input.targetWeek);
+    return { ...item, signal: classifyNews(item), usable: usability.usable, unusableNote: usability.note };
+  }).sort((a, b) => Date.parse(b.publishedAt || '') - Date.parse(a.publishedAt || '') || 0);
+  for (const item of classified.filter(candidate => candidate.signal !== 'neutral')) {
+    evidence.push({
+      source: item.source, kind: 'news', detail: item.headline, publishedAt: item.publishedAt, retrievedAt: input.sleeperRetrievedAt,
+      targetWeek: /\bweek\s*(\d{1,2})\b/i.exec(`${item.headline} ${item.summary || ''}`)?.[1] ? Number(/\bweek\s*(\d{1,2})\b/i.exec(`${item.headline} ${item.summary || ''}`)![1]) : null,
+      used: item.usable && item.signal !== 'neutral', note: item.usable ? `Classified ${item.signal}.` : item.unusableNote
+    });
+  }
+  const usableNews = classified.filter(item => item.usable);
+  const decisive = usableNews.find(item => item.signal !== 'neutral');
+  const strip = (item: (typeof classified)[number]) => ({ source: item.source, headline: item.headline, summary: item.summary, url: item.url, publishedAt: item.publishedAt, signal: item.signal });
+  const latestNews = decisive ? strip(decisive) : status !== 'ACTIVE' && usableNews[0] ? strip(usableNews[0]) : null;
   const newsSignal: NewsSignal = decisive?.signal || 'neutral';
 
   const { value, policy } = playProbability(status, level, newsSignal);
@@ -101,14 +165,18 @@ export function assessAvailability(input: AvailabilityInput): AvailabilityAssess
   const reasons: string[] = [];
   let confidence: AvailabilityAssessment['confidence'];
   const contradicted = (status === 'OUT' || status === 'DOUBTFUL' || status === 'IR') && (level === 'full' || newsSignal === 'positive');
+  const newsConflict = contradicted || (newsSignal === 'negative' && !concern);
   if (sourceStale) { confidence = 'Low'; reasons.push('The injury source could not be refreshed this run; an older cached copy was used.'); }
   else if (contradicted) { confidence = 'Low'; reasons.push('Sources conflict: the designation is severe but practice or news points the other way.'); }
+  else if (sleeperPossiblyPriorWeek && !officialDesignation) { confidence = 'Low'; reasons.push('Only a Sleeper designation that has not been updated in over a week; it may be left over from a prior week.'); }
   else if (concern && (officialDesignation || newsSignal === 'negative')) {
     confidence = 'High';
     reasons.push(officialDesignation ? 'Official NFL injury report designation for this week.' : 'Sleeper designation is corroborated by independent recent news.');
   } else if (concern) { confidence = 'Medium'; reasons.push('Single unofficial source (Sleeper); no official report or corroborating news found.'); }
   else if (newsSignal === 'negative') { confidence = 'Low'; reasons.push('Recent news suggests a concern, but neither Sleeper nor the official report lists a designation.'); }
   else { confidence = 'High'; reasons.push('No designation from Sleeper or the official report, and no negative news.'); }
+  const ignoredNews = classified.filter(item => !item.usable).length;
+  if (ignoredNews) reasons.push(`${ignoredNews} news item${ignoredNews === 1 ? ' was' : 's were'} ignored as old, undated, or about another week.`);
 
   const riskFlag: RiskFlag = value === 0 ? 'EXCLUDED' : value <= 0.5 ? 'AVOID' : value < 1 || newsSignal === 'negative' ? 'WATCH' : 'NONE';
   const gameStarted = input.gameTime ? Date.parse(input.gameTime) <= input.now.getTime() : false;
@@ -116,7 +184,8 @@ export function assessAvailability(input: AvailabilityInput): AvailabilityAssess
   return {
     status, rawStatus: combined.rawStatus, injury: combined.bodyPart, practice, practiceLevel: level, statusSource, statusUpdatedAt,
     retrievedAt: officialDrives && !sleeperDrives ? input.officialRetrievedAt : input.sleeperRetrievedAt, sourceStale,
-    latestNews, newsSignal, playProbability: value, riskFlag, confidence, confidenceReasons: reasons, gameStarted, policy
+    latestNews, newsSignal, playProbability: value, riskFlag, confidence, confidenceReasons: reasons, gameStarted, policy,
+    evidence, targetWeek: input.targetWeek, newsConflict
   };
 }
 

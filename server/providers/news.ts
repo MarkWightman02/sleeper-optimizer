@@ -51,17 +51,32 @@ export async function loadEspnNews(forceRefresh: boolean): Promise<EspnNewsResul
 
 export interface RotoBallerNewsResult { items: NewsItem[]; outcome: SourceOutcome }
 
-function parseRss(xml: string): NewsItem[] {
+const NAMED_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', rsquo: '\u2019', lsquo: '\u2018', rdquo: '\u201d', ldquo: '\u201c', ndash: '\u2013', mdash: '\u2014', hellip: '\u2026' };
+
+export function decodeEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => String.fromCodePoint(Number(dec)))
+    .replace(/&([a-z]+);/gi, (whole, name: string) => NAMED_ENTITIES[name.toLowerCase()] ?? whole);
+}
+
+const cleanText = (raw: string): string => decodeEntities(raw.replace(/<!\[CDATA\[|\]\]>/g, '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+
+export function parseRss(xml: string): NewsItem[] {
   const items: NewsItem[] = [];
   const blocks = xml.split('<item>').slice(1);
   for (const block of blocks.slice(0, 40)) {
-    const title = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/.exec(block)?.[1]?.trim();
+    const title = /<title>([\s\S]*?)<\/title>/.exec(block)?.[1];
     const link = /<link>([\s\S]*?)<\/link>/.exec(block)?.[1]?.trim();
     const pubDate = /<pubDate>([\s\S]*?)<\/pubDate>/.exec(block)?.[1]?.trim();
-    const descriptionRaw = /<description>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/description>/.exec(block)?.[1]?.trim();
-    if (!title) continue;
-    const summary = descriptionRaw ? descriptionRaw.replace(/<[^>]+>/g, '').slice(0, 240).trim() : null;
-    items.push({ source: ROTOBALLER_SOURCE, headline: title, summary, url: link || null, publishedAt: pubDate ? new Date(pubDate).toISOString() : null });
+    const descriptionRaw = /<description>([\s\S]*?)<\/description>/.exec(block)?.[1];
+    const headline = title ? cleanText(title) : '';
+    if (!headline) continue;
+    const parsedDate = pubDate ? Date.parse(pubDate) : NaN;
+    items.push({
+      source: ROTOBALLER_SOURCE, headline, summary: descriptionRaw ? cleanText(descriptionRaw).slice(0, 240) || null : null,
+      url: link || null, publishedAt: Number.isFinite(parsedDate) ? new Date(parsedDate).toISOString() : null
+    });
   }
   return items;
 }
@@ -71,14 +86,23 @@ export async function loadRotoBallerNews(forceRefresh: boolean): Promise<RotoBal
   return { items: value || [], outcome };
 }
 
-/** Matches news items to a specific set of players by normalized full-name substring, used only for sources without a reliable athlete ID (e.g. RSS feeds). */
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Matches news items to players by whole-word full name (RSS feeds carry no athlete ids). Names shared by more than one
+ * relevant player (two "Josh Allen"s) are skipped rather than guessed, and a name embedded inside a longer name is not a match.
+ */
 export function matchNewsByName(items: NewsItem[], players: Array<{ sleeperId: string; name: string }>): Map<string, NewsItem[]> {
   const result = new Map<string, NewsItem[]>();
-  const candidates = players.filter(player => player.name.trim().includes(' '));
+  const nameCounts = new Map<string, number>();
+  for (const player of players) { const key = player.name.trim().toLowerCase(); nameCounts.set(key, (nameCounts.get(key) || 0) + 1); }
+  const candidates = players
+    .filter(player => player.name.trim().includes(' ') && nameCounts.get(player.name.trim().toLowerCase()) === 1)
+    .map(player => ({ sleeperId: player.sleeperId, pattern: new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(player.name.trim())}(?![\\p{L}\\p{N}])`, 'iu') }));
   for (const item of items) {
-    const haystack = `${item.headline} ${item.summary || ''}`.toLowerCase();
-    for (const player of candidates) {
-      if (haystack.includes(player.name.toLowerCase())) result.set(player.sleeperId, [...(result.get(player.sleeperId) || []), item]);
+    const text = `${item.headline} ${item.summary || ''}`;
+    for (const candidate of candidates) {
+      if (candidate.pattern.test(text)) result.set(candidate.sleeperId, [...(result.get(candidate.sleeperId) || []), item]);
     }
   }
   return result;

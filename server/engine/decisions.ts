@@ -22,7 +22,7 @@ function classify(start: PlayerEvaluation, bench: PlayerEvaluation, band: number
   return { kind: 'PROJECTION', difference };
 }
 
-export function buildDecision(start: PlayerEvaluation, bench: PlayerEvaluation, band: number, correlationTiebreak: boolean): LineupDecision {
+export function buildDecision(start: PlayerEvaluation, bench: PlayerEvaluation, band: number, correlationTiebreak: string | null): LineupDecision {
   const { kind, difference } = classify(start, bench, band);
   const a = bench.availability;
   const startExpected = start.expectedPoints ?? start.weeklyPoints;
@@ -77,7 +77,7 @@ export function buildDecision(start: PlayerEvaluation, bench: PlayerEvaluation, 
       ? `This pair is part of a multi-slot reshuffle: the solver maximized the whole lineup's expected points, not this pair in isolation.`
       : `Both players are healthy enough to take the normal projection-first path; the higher expected-points player was chosen.`);
     if (kind === 'TOSS_UP') logic.push(`A gap of ${gapText} is far inside projection noise. Keeping ${bench.name} would be equally reasonable.`);
-    if (correlationTiebreak) logic.push(`Correlation tiebreak applied: a QB/pass-catcher relationship with your opponent's lineup was used because the projections were within the decision band. It cannot outweigh a real projection gap.`);
+    if (correlationTiebreak) logic.push(`Correlation tiebreak applied (it can only choose between options inside the decision band, never outweigh a real projection gap): ${correlationTiebreak}`);
     if (bench.availability && bench.availability.riskFlag !== 'NONE') logic.push(`${bench.name}'s availability (${bench.availability.status}) was noted but did not decide this pair.`);
     change.push(`This changes if either player's published projection or availability changes; re-run Optimize after the next injury report or projection update.`);
   }
@@ -85,7 +85,7 @@ export function buildDecision(start: PlayerEvaluation, bench: PlayerEvaluation, 
     kind, headline, startId: start.playerId, startName: start.name, benchId: bench.playerId, benchName: bench.name,
     startProjection: start.weeklyPoints, benchProjection: bench.weeklyPoints, difference, projectionSacrifice: sacrifice,
     startExpected: startExpected ?? null, benchExpected: benchExpected ?? null, benchAvailability: a || null,
-    whyLowerProjection: whyLower, decisionLogic: logic, whatCouldChange: change, correlationTiebreak
+    whyLowerProjection: whyLower, decisionLogic: logic, whatCouldChange: change, correlationTiebreak: Boolean(correlationTiebreak)
   };
 }
 
@@ -93,7 +93,7 @@ export function buildDecision(start: PlayerEvaluation, bench: PlayerEvaluation, 
  * Marks which recommended starters are genuinely new (not starting today, in any slot) and attaches a structured decision
  * pairing each with the current starter it displaces. Slot-order shuffles of players already starting are not "changes".
  */
-export function attachLineupDecisions(current: LineupEntry[], recommended: LineupEntry[], band: number, tiebrokenIds: Set<string>): void {
+export function attachLineupDecisions(current: LineupEntry[], recommended: LineupEntry[], band: number, tiebreaks: Map<string, string>): void {
   const recommendedIds = new Set(recommended.flatMap(entry => entry.player ? [entry.player.playerId] : []));
   const currentIds = new Set(current.flatMap(entry => entry.player ? [entry.player.playerId] : []));
   const displaced = current.flatMap((entry, index) => entry.player && !recommendedIds.has(entry.player.playerId) ? [{ index, player: entry.player }] : []);
@@ -111,6 +111,6 @@ export function attachLineupDecisions(current: LineupEntry[], recommended: Lineu
     if (!pair) return;
     used.add(pair.index);
     entry.previousPlayerId = pair.player.playerId;
-    entry.decision = buildDecision(player, pair.player, band, tiebrokenIds.has(player.playerId));
+    entry.decision = buildDecision(player, pair.player, band, tiebreaks.get(player.playerId) ?? null);
   });
 }

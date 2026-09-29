@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { availabilityPlayer } from '../fixtures/leagues.js';
-import { assessAvailability, availabilityFields, classifyNews, playProbability, practiceLevel } from './availability.js';
+import { assessAvailability, availabilityFields, classifyNews, newsUsability, playProbability, practiceLevel } from './availability.js';
 import type { SleeperPlayer } from '../../shared/types.js';
 
 const NOW = new Date('2026-09-29T12:00:00.000Z');
@@ -89,5 +89,42 @@ describe('availability assessment', () => {
     expect(out.eligible).toBe(false);
     expect(out.expectedPoints).toBe(0);
     expect(availabilityFields(null, assess(base({}))).expectedPoints).toBeNull();
+  });
+});
+
+describe('injury evidence recency and week correctness', () => {
+  const news = (headline: string, publishedAt: string | null, summary: string | null = null) => ({ source: 'ESPN NFL News', headline, summary, url: null, publishedAt });
+
+  it('ignores undated, stale, future, and other-week news; accepts recent target-week or unlabeled news', () => {
+    expect(newsUsability(news('RB out', null), NOW, 4).usable).toBe(false);
+    expect(newsUsability(news('RB out', '2026-09-10T00:00:00Z'), NOW, 4).usable).toBe(false);
+    expect(newsUsability(news('RB out', '2026-10-02T00:00:00Z'), NOW, 4).usable).toBe(false);
+    expect(newsUsability(news('RB out for Week 3', '2026-09-28T00:00:00Z'), NOW, 4)).toMatchObject({ usable: false });
+    expect(newsUsability(news('RB out for Week 4', '2026-09-28T00:00:00Z'), NOW, 4).usable).toBe(true);
+    expect(newsUsability(news('RB ruled out', '2026-09-28T00:00:00Z'), NOW, 4).usable).toBe(true);
+  });
+
+  it('does not let an old or prior-week negative story change the availability of a healthy player', () => {
+    const a = assess(base({}), { targetWeek: 4, news: [news('RB ruled out for Week 3', '2026-09-27T00:00:00Z'), news('RB out with knee injury', '2026-09-01T00:00:00Z')] });
+    expect(a.status).toBe('ACTIVE');
+    expect(a.playProbability).toBe(1);
+    expect(a.latestNews).toBeNull();
+    expect(a.evidence.every(ev => !ev.used)).toBe(true);
+    expect(a.evidence.map(ev => ev.note).join(' ')).toContain('Week 3');
+  });
+
+  it('retains source, timestamps, target week and usage for the evidence behind a decision', () => {
+    const a = assess(base({ injury_status: 'Questionable', news_updated: Date.parse('2026-09-29T09:00:00Z') }), { targetWeek: 4, news: [news('RB is week-to-week', '2026-09-29T10:00:00Z')] });
+    const sleeper = a.evidence.find(ev => ev.kind === 'sleeper-status')!;
+    expect(sleeper).toMatchObject({ source: 'Sleeper player status', used: true, publishedAt: '2026-09-29T09:00:00.000Z' });
+    const story = a.evidence.find(ev => ev.kind === 'news')!;
+    expect(story).toMatchObject({ used: true, publishedAt: '2026-09-29T10:00:00Z' });
+    expect(a.targetWeek).toBe(4);
+    expect(story.retrievedAt).toBe('2026-09-29T11:59:00.000Z');
+  });
+
+  it('flags a Sleeper Questionable label that predates the target week as Low confidence', () => {
+    const a = assess(base({ injury_status: 'Questionable', news_updated: Date.parse('2026-09-10T00:00:00Z') }), { targetWeek: 4 });
+    expect(a.confidence).toBe('Low');
   });
 });

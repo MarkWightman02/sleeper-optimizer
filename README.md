@@ -20,6 +20,13 @@ It never asks for a Sleeper password or calls a Sleeper write endpoint. Every re
 
 ## Run with Docker
 
+Clone the repository onto any Docker host:
+
+```bash
+git clone https://github.com/MarkWightman02/sleeper-optimizer.git
+cd sleeper-optimizer
+```
+
 Docker Engine with Docker Compose is the only host requirement. No `.env` values are required — copy it only if you want to override the default port/host.
 
 ```bash
@@ -48,7 +55,7 @@ curl http://127.0.0.1:8009/api/health
 | ESPN NFL News API (`site.web.api.espn.com`) | No auth | Recent player news, matched to players by ESPN's own athlete-ID tags |
 | [RotoBaller RSS feed](https://www.rotoballer.com/feed) | Public RSS | A second, independent news source |
 
-Every source is fetched with a short, identifying User-Agent, a bounded timeout, and a cache TTL appropriate to how often it actually changes (volatile data such as injuries, news and projections is re-fetched on every run; only the ID crosswalk is cached for 24h). **FantasyPros is not used anywhere in this application** — it has been fully removed, along with any paid provider.
+Every source is fetched with a short, identifying User-Agent, a bounded timeout, and a cache TTL appropriate to how often it actually changes (volatile data such as injuries, news and projections is re-fetched on every run; only the ID crosswalk is cached for 24h). No paid provider is used anywhere in this application.
 
 ### Source resilience
 
@@ -82,6 +89,10 @@ SQLite in `/data` stores app configuration, the Sleeper catalog, provider respon
 - `GET /api/diagnostics`
 - `POST /api/optimize` with optional `{ "forceRefresh": true }`
 - `DELETE /api/cache/external` — clears all cached external source data
+
+## Versioning
+
+Semantic versioning; the canonical version lives in `package.json` (currently `0.1.0`) and is shown at the bottom of the Settings/Diagnostics tab. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Development and tests
 

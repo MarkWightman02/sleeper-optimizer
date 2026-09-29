@@ -18,16 +18,30 @@ export function normalizePlayerName(value: string): string {
   return value.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\b(jr|sr|ii|iii|iv|v)\b\.?/g, '').replace(/[^a-z0-9]/g, '');
 }
 
+/** Alternate NFL team codes → one internal code. The DynastyProcess crosswalk uses GBP/KCC/NEP-style codes for some players. */
+const TEAM_ALIASES: Record<string, string> = {
+  JAX: 'JAC', LA: 'LAR', STL: 'LAR', RAM: 'LAR', OAK: 'LV', LVR: 'LV', SD: 'LAC', SDG: 'LAC', WSH: 'WAS',
+  GBP: 'GB', KCC: 'KC', NEP: 'NE', NOS: 'NO', SFO: 'SF', TBB: 'TB', ARZ: 'ARI', BLT: 'BAL', CLV: 'CLE', HST: 'HOU'
+};
+
 export function normalizeTeam(value?: string | null): string | null {
   if (!value) return null;
   const team = value.toUpperCase();
-  return ({ JAX: 'JAC', LA: 'LAR', STL: 'LAR', OAK: 'LV', SD: 'LAC', WSH: 'WAS' } as Record<string, string>)[team] || team;
+  return TEAM_ALIASES[team] || team;
+}
+
+/** Sleeper's own team code (JAX, LAR, LV…): used for display and for team-defense ids, which Sleeper keys by team code. */
+export function sleeperTeamCode(value?: string | null): string | null {
+  if (!value) return null;
+  const team = value.toUpperCase();
+  return ({ JAC: 'JAX', LA: 'LAR', STL: 'LAR', OAK: 'LV', SD: 'LAC', WSH: 'WAS' } as Record<string, string>)[team] || team;
 }
 
 export function normalizePosition(value?: string | null): string | null {
   if (!value) return null;
   const position = value.toUpperCase();
   if (position === 'DST' || position === 'D/ST') return 'DEF';
+  if (position === 'PK') return 'K';
   if (['DE', 'DT'].includes(position)) return 'DL';
   if (['CB', 'S', 'FS', 'SS'].includes(position)) return 'DB';
   return position;

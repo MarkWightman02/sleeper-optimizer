@@ -146,6 +146,24 @@ export interface ScoringComponent {
   note?: string;
 }
 
+/** Where a projection came from and the untouched provider numbers behind it, so any headline value can be reconciled. */
+export interface ProjectionProvenance {
+  season: number;
+  week: number;
+  /** ESPN stat entry descriptors: statSourceId 1 = projection (0 = actual), statSplitTypeId 1 = single scoring period. */
+  statSourceId: number;
+  statSplitTypeId: number;
+  providerPlayerId: string;
+  providerPlayerName: string | null;
+  /** Raw provider stat line by stat id, exactly the values that fed the conversion. */
+  rawStatLine: Record<string, number>;
+  /** Scoring rules the provider could express but did not project for this player (contribute 0, do not lower coverage). */
+  omittedKeys: string[];
+  /** Minor scoring keys the provider has no projection for (ignored, listed for transparency). */
+  minorUnmodeledKeys: string[];
+  approximations: string[];
+}
+
 /** A numeric fantasy-point forecast actually published by one external source. Never fabricated. */
 export interface ProjectionValue {
   source: string;
@@ -154,15 +172,24 @@ export interface ProjectionValue {
   unsupportedScoringKeys?: string[];
   coverage?: number;
   retrievedAt: string | null;
+  /** True when this value came from an older cached copy because the live fetch failed. */
+  stale?: boolean;
+  provenance?: ProjectionProvenance;
 }
 
-/** A published ordinal rank from one external source. Never converted into points. */
+/** A published ordinal rank from one external source (or an aggregate of its expert panel). Never converted into points. */
 export interface RankingValue {
   source: string;
+  /** Median positional rank across the source's experts when several are published. */
   positionRank: number | null;
   overallRank: number | null;
   scoringType?: string | null;
   retrievedAt: string | null;
+  week?: number;
+  expertCount?: number;
+  rankMin?: number | null;
+  rankMax?: number | null;
+  stale?: boolean;
 }
 
 /** Short, factual, attributed news context. Never a full copied article. */
@@ -188,6 +215,21 @@ export type NewsSignal = 'negative' | 'positive' | 'neutral';
  * Availability is kept strictly separate from the published projection. `playProbability` is a documented,
  * deterministic policy value (see server/engine/availability.ts) — it is NOT a projection and never rewrites one.
  */
+export interface AvailabilityEvidence {
+  source: string;
+  kind: 'official-report' | 'sleeper-status' | 'news';
+  /** What this source said (designation, practice status or headline). */
+  detail: string;
+  /** When the source itself published/updated it; null when the source exposes no timestamp. */
+  publishedAt: string | null;
+  retrievedAt: string | null;
+  /** NFL week the evidence applies to; null when the source does not say. */
+  targetWeek: number | null;
+  /** Whether this evidence drove the availability decision (false = ignored, see `note`). */
+  used: boolean;
+  note?: string;
+}
+
 export interface AvailabilityAssessment {
   status: NormalizedInjuryStatus;
   rawStatus: string | null;
@@ -206,6 +248,11 @@ export interface AvailabilityAssessment {
   confidenceReasons: string[];
   gameStarted: boolean;
   policy: string;
+  /** Every injury-relevant source considered, with timestamps, target week and whether it was used. */
+  evidence?: AvailabilityEvidence[];
+  targetWeek?: number;
+  /** Recent news contradicts the listed designation (or signals trouble with no designation at all). */
+  newsConflict?: boolean;
 }
 
 export interface PlayerEvaluation {
@@ -231,6 +278,8 @@ export interface PlayerEvaluation {
   expectedPoints?: number | null;
   restOfSeasonValue: number | null;
   confidence: 'High' | 'Medium' | 'Low' | 'Unavailable';
+  /** Data-quality reasons behind `confidence` (never about player quality). */
+  confidenceReasons?: string[];
   rosterStatus: 'starter' | 'bench' | 'reserve' | 'taxi' | 'free_agent' | 'owned';
   eligible: boolean;
   ownedBy?: number | null;
@@ -317,6 +366,20 @@ export interface ReplacementLevel {
   dropOffCurve: number[];
 }
 
+export type MappingMethodGroup = 'crosswalk_sleeper_id' | 'espn_id' | 'gsis_id' | 'name_team_position' | 'name_position' | 'persisted' | 'team_code' | 'ambiguous' | 'unmapped';
+
+export interface MappingAudit {
+  /** Players considered: rostered by any team plus the free-agent pool the app evaluates. */
+  scope: string;
+  total: number;
+  byMethod: Record<MappingMethodGroup, number>;
+  /** Mapped players whose identity rests on a fuzzy fallback (name-based) rather than an ID join. */
+  fallbackCount: number;
+  /** ESPN players with a real weekly projection that were not joined to any Sleeper player (missed mappings). */
+  espnProjectedButUnmapped: Array<{ espnId: string; name: string; team: string | null; position: string; points: number }>;
+  needsReview: Array<{ name: string; team: string | null; position: string | null; method: string | null; confidence: MappingConfidence; sleeperPlayerId: string | null }>;
+}
+
 export interface MappingDiagnostic {
   sleeperPlayerId?: string | null;
   externalPlayerId?: string | null;
@@ -338,6 +401,7 @@ export interface SourceStatus {
   status: SourceStatusValue;
   detail?: string;
   retrievedAt: string | null;
+  sourceUpdatedAt?: string | null;
   /** True when this run could not refresh the source and fell back to an older cached copy. */
   stale?: boolean;
 }
@@ -360,6 +424,16 @@ export interface AnalysisDiagnostics {
   lastSleeperRefresh: string | null;
   mappings: MappingDiagnostic[];
   lastOptimizationDurationMs?: number;
+  mappingAudit?: MappingAudit;
+  dataConfidence?: DataConfidence;
+}
+
+export interface DataConfidence {
+  level: 'High' | 'Medium' | 'Low';
+  reasons: string[];
+  sourcesSuccessful: number;
+  sourcesAttempted: number;
+  sourcesStale: number;
 }
 
 export interface LeagueTeamView {
@@ -375,15 +449,50 @@ export interface LeagueTeamView {
   weaknesses: string[];
 }
 
+export type CorrelationKind =
+  | 'CATCHER_VS_OPPONENT_QB' | 'QB_VS_OPPONENT_CATCHER'
+  | 'MY_STACK' | 'OPPONENT_STACK'
+  | 'MY_DEFENSE_VS_OPPONENT_OFFENSE' | 'OPPONENT_DEFENSE_VS_MY_OFFENSE'
+  | 'MY_SHARED_QB' | 'OPPONENT_SHARED_QB';
+
+export interface CorrelationPlayerRef {
+  playerId: string;
+  name: string;
+  side: 'mine' | 'opponent';
+  position: string;
+  team: string | null;
+  slot: string | null;
+  projection: number | null;
+}
+
 export interface CorrelationNote {
-  myPlayerId: string;
-  myPlayerName: string;
-  opponentPlayerId: string;
-  opponentPlayerName: string;
+  kind: CorrelationKind;
+  title: string;
   team: string;
-  relationship: string;
+  players: CorrelationPlayerRef[];
   explanation: string;
+  /** The projected scoring that actually overlaps (the numbers that made the relationship worth showing). */
+  overlap: string;
+  effect: 'DECISION_CHANGING' | 'INFORMATIONAL';
+  effectNote: string;
   appliedAsTiebreak: boolean;
+}
+
+export interface TiebreakDecision {
+  slot: string;
+  chosenId: string;
+  chosenName: string;
+  alternativeId: string;
+  alternativeName: string;
+  chosenProjection: number | null;
+  alternativeProjection: number | null;
+  /** Alternative minus chosen expected points: what the tiebreak gave up (0 or negative means the chosen player also projected at least as high). */
+  projectionGiven: number;
+  band: number;
+  posture: 'FAVORITE' | 'UNDERDOG';
+  projectedMargin: number;
+  correlatedWith: string;
+  explanation: string;
 }
 
 export interface MatchupTeamLine {
@@ -392,21 +501,74 @@ export interface MatchupTeamLine {
   name: string;
   positions: string[];
   team: string | null;
+  /** NFL opponent this week. */
   opponent: string | null;
   weeklyPoints: number | null;
+  expectedPoints: number | null;
+  playProbability: number | null;
   status: string | null;
+  statusDetail: string | null;
   confidence: PlayerEvaluation['confidence'];
 }
 
+export interface PositionEdge {
+  group: string;
+  mine: number | null;
+  opponent: number | null;
+  difference: number | null;
+  myPlayers: string[];
+  opponentPlayers: string[];
+}
+
+export interface UncertainStarter {
+  side: 'mine' | 'opponent';
+  playerId: string;
+  name: string;
+  slot: string;
+  status: string;
+  playProbability: number | null;
+  weeklyPoints: number | null;
+  detail: string;
+}
+
+export interface UncertaintyProfile {
+  /** Σ published projection × (1 − chance of playing) across starters: points at risk from availability. */
+  availabilityExposure: number;
+  /** Starters whose data confidence is below High. */
+  lowerConfidenceStarters: number;
+  /** Starters with no usable projection at all. */
+  unprojectedStarters: number;
+}
+
+export interface WaiverMatchupNote {
+  add: string;
+  drop: string;
+  note: string;
+}
+
 export interface MatchupAnalysis {
+  matchupId: number | null;
   opponentRosterId: number | null;
   opponentName: string;
+  /** Availability-weighted totals (published projection × chance of playing) of the lineups shown below. */
   myProjected: number | null;
   opponentProjected: number | null;
   difference: number | null;
+  totalBasis: string;
+  myPublished: number | null;
+  opponentPublished: number | null;
+  incompleteStarters: { mine: string[]; opponent: string[] };
   myLineup: MatchupTeamLine[];
   opponentLineup: MatchupTeamLine[];
+  positionEdges: PositionEdge[];
+  largestAdvantages: PositionEdge[];
+  largestDisadvantages: PositionEdge[];
+  uncertainStarters: UncertainStarter[];
+  uncertainty: { mine: UncertaintyProfile; opponent: UncertaintyProfile; moreUncertain: 'mine' | 'opponent' | 'even' | 'unclear'; explanation: string };
   correlations: CorrelationNote[];
+  tiebreaks: TiebreakDecision[];
+  waiverContext: WaiverMatchupNote[];
+  winProbabilityNote: string;
 }
 
 export interface WeekSelection {
@@ -420,7 +582,11 @@ export interface WeekSelection {
   matchupNote: string | null;
 }
 
+/** Bump when the stored AnalysisResult shape changes incompatibly; older snapshots are then ignored instead of crashing the UI. */
+export const ANALYSIS_SCHEMA_VERSION = 2;
+
 export interface AnalysisResult {
+  schemaVersion: number;
   weekSelection?: WeekSelection;
   id: string;
   analyzedAt: string;

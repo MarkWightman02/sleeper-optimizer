@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type {
-  AnalysisDiagnostics, AnalysisResult, AppConfig, CorrelationNote, LeagueTeamView, MappingDiagnostic, MatchupAnalysis, MatchupTeamLine,
+  AnalysisDiagnostics, AnalysisResult, AppConfig, LeagueTeamView, LineupEntry, MappingDiagnostic, MatchupAnalysis,
   NewsItem, PlayerEvaluation, ProgressEvent, RankingValue, SleeperLeague, SleeperPlayer, SleeperRoster, SleeperMatchup, SleeperUser, SourceStatus, RoleEvidence, WeekSelection, SupportingDataPoint
 } from '../../shared/types.js';
+import { ANALYSIS_SCHEMA_VERSION } from '../../shared/types.js';
 import { getSleeperCacheInfo } from '../db.js';
 import { loadEspnProjections } from '../providers/espn.js';
 import type { DepthChartRow, GameRow, InjuryRow, WeeklyStatRow } from '../providers/nflverse.js';
@@ -11,11 +12,13 @@ import { loadEspnNews, loadRotoBallerNews, matchNewsByName } from '../providers/
 import { STALE_FALLBACK_DETAIL } from '../providers/freshness.js';
 import type { ExternalPlayerData, SourceOutcome } from '../providers/types.js';
 import { loadCrosswalk } from '../services/crosswalk.js';
-import { normalizePlayerName, normalizeTeam, resolvePlayerIdentities } from '../services/player-mapping.js';
+import { normalizePlayerName, normalizeTeam, resolvePlayerIdentities, sleeperTeamCode } from '../services/player-mapping.js';
 import { sleeperApi } from '../services/sleeper.js';
 import { easternToIso } from '../utils/time.js';
-import { buildCorrelationNotes, correlationBonusMap } from './correlation.js';
-import { combineProjections, computeConfidence } from './consensus.js';
+import { buildCorrelationNotes, buildTiebreaks, correlationBonusMap, type Posture } from './correlation.js';
+import { compareUncertainty, largestEdges, lineupTotals, matchupLine, positionEdges, uncertainStarters, uncertaintyProfile, waiverMatchupNotes, WIN_PROBABILITY_NOTE } from './matchup.js';
+import { combineProjections, computeConfidence, computeDataConfidence } from './consensus.js';
+import { buildMappingAudit } from './mapping-audit.js';
 import { assessAvailability, availabilityFields } from './availability.js';
 import { attachLineupDecisions } from './decisions.js';
 import { selectTargetWeek } from './target-week.js';
@@ -42,7 +45,10 @@ function rosterStatus(id: string, roster: SleeperRoster): PlayerEvaluation['rost
   return 'bench';
 }
 
-interface AvailabilityContext { now: Date; sleeperRetrievedAt: string | null; sleeperStale: boolean; officialRetrievedAt: string | null; officialStale: boolean }
+interface AvailabilityContext { now: Date; targetWeek: number; sleeperRetrievedAt: string | null; sleeperStale: boolean; officialRetrievedAt: string | null; officialSourceUpdatedAt: string | null; officialStale: boolean }
+
+/** Depth-chart rows not refreshed within this many days are ignored (released players and off-season leftovers). */
+export const DEPTH_CHART_MAX_AGE_DAYS = 14;
 
 /** Per-player supporting context assembled once per run from nflverse datasets, keyed by gsis_id/name+team. */
 interface SupportingContext {
@@ -54,20 +60,30 @@ interface SupportingContext {
   depthByTeamPos: Map<string, DepthChartRow[]>;
   /** Sleeper catalog entries by gsis_id, attached by runAnalysis; used to read teammates' injury status. */
   sleeperByGsis?: Map<string, SleeperPlayer>;
+  /** Positional rank of each player's league-rescored projection among all projected players at that position. */
+  projectionRankBySleeperId?: Map<string, number>;
 }
 
-export function buildSupportingContext(season: string, week: number, games: GameRow[], depthCharts: DepthChartRow[], injuries: InjuryRow[], weeklyStats: WeeklyStatRow[], snapCounts: Array<Record<string, string>>): SupportingContext {
+export function buildSupportingContext(season: string, week: number, games: GameRow[], depthCharts: DepthChartRow[], injuries: InjuryRow[], weeklyStats: WeeklyStatRow[], snapCounts: Array<Record<string, string>>, now: Date = new Date()): SupportingContext {
   const scheduleByTeam = new Map<string, { opponent: string; gameTime: string | null }>();
   for (const game of games) {
     if (String(game.season) !== season || Number(game.week) !== week) continue;
     const gameTime = game.gameday && game.gametime ? easternToIso(game.gameday, game.gametime) : null;
-    scheduleByTeam.set(game.home_team, { opponent: game.away_team, gameTime });
-    scheduleByTeam.set(game.away_team, { opponent: game.home_team, gameTime });
+    // nflverse uses JAX/LA where Sleeper uses JAX/LAR (and ESPN LAR); everything is keyed by the normalized code.
+    const home = normalizeTeam(game.home_team);
+    const away = normalizeTeam(game.away_team);
+    if (!home || !away) continue;
+    scheduleByTeam.set(home, { opponent: sleeperTeamCode(away)!, gameTime });
+    scheduleByTeam.set(away, { opponent: sleeperTeamCode(home)!, gameTime });
   }
   const injuriesByGsis = new Map<string, InjuryRow>();
   for (const row of injuries) if (Number(row.week) === week && row.gsis_id) injuriesByGsis.set(row.gsis_id, row);
   const depthByGsis = new Map<string, DepthChartRow>();
-  for (const row of depthCharts) if (row.gsis_id && (!depthByGsis.has(row.gsis_id) || row.dt > depthByGsis.get(row.gsis_id)!.dt)) depthByGsis.set(row.gsis_id, row);
+  const depthCutoff = now.getTime() - DEPTH_CHART_MAX_AGE_DAYS * 86_400_000;
+  for (const row of depthCharts) {
+    if (!row.gsis_id || !(Date.parse(row.dt) >= depthCutoff)) continue;
+    if (!depthByGsis.has(row.gsis_id) || row.dt > depthByGsis.get(row.gsis_id)!.dt) depthByGsis.set(row.gsis_id, row);
+  }
   const recentFormByGsis = new Map<string, WeeklyStatRow[]>();
   for (const row of weeklyStats) {
     if (!row.player_id || Number(row.week) >= week) continue;
@@ -148,20 +164,22 @@ function makeEvaluation(
   const rankings: RankingValue[] = espn?.rankings || [];
   const consensus = combineProjections(projections);
   const supportingData = [...(espn?.supportingData || []), ...supportingDataFor(player, gsisId, supporting)];
-  const confidence = computeConfidence({
-    projectionValues: projections.map(p => p.points),
-    rankingCount: rankings.length,
+  const confidenceResult = computeConfidence({
+    projections, rankings,
+    projectionPositionRank: supporting.projectionRankBySleeperId?.get(id) ?? null,
     mappingConfidence: identity?.confidence || 'unmapped',
     normalizedInjuryStatus: normalized,
-    coverage: consensus.coverage
+    availabilityConfidence: availability.confidence,
+    newsConflict: availability.newsConflict
   });
+  const confidence = confidenceResult.level;
 
   const reasons: string[] = [];
   if (consensus.points != null) reasons.push(`Consensus projection: ${consensus.points.toFixed(1)} points from ${projections.length} source${projections.length === 1 ? '' : 's'} (${projections.map(p => `${p.source} ${p.points.toFixed(1)}`).join(', ')}).`);
   if (rankings.length) reasons.push(`Rankings: ${rankings.map(r => `${r.source} ${r.scoringType || ''} #${r.positionRank}`).join(', ')}.`);
   if (identity) reasons.push(`Player identity: ${identity.confidence}${identity.method ? ` via ${identity.method}` : ''}.`);
   if (normalized !== 'ACTIVE' || availability.riskFlag !== 'NONE') reasons.push(`Availability (kept separate from the projection): ${normalized}${rawStatus ? ` (${rawStatus})` : ''}, ${availability.injury || 'no injury detail'}; ${availability.policy}; confidence ${availability.confidence}.`);
-  if (!projections.length) reasons.push('No projection source covered this player this week; no points were inferred.');
+  if (!projections.length) reasons.push(`No projection was published for this player this week; no points were inferred. ${espn?.missingReason || 'ESPN did not list this player.'}`);
   for (const item of news.slice(0, 2)) reasons.push(`News (${item.source}): ${item.headline}`);
   const derived = availabilityFields(consensus.points, availability);
 
@@ -173,7 +191,7 @@ function makeEvaluation(
     probabilityOfPlaying: null, availability: derived.availability, expectedPoints: derived.expectedPoints,
     opponent: schedule?.opponent || null, gameTime: schedule?.gameTime || null,
     weeklyPoints: consensus.points, restOfSeasonValue: null,
-    confidence, rosterStatus: status, ownedBy, isFreeAgent: ownedBy == null,
+    confidence, confidenceReasons: confidenceResult.reasons, rosterStatus: status, ownedBy, isFreeAgent: ownedBy == null,
     eligible: player?.active !== false && derived.eligible, projectionCoverage: consensus.coverage,
     mappingConfidence: identity?.confidence || 'unmapped', mappingMethod: identity?.method || null,
     scoringComponents: espn?.scoringComponents || [], unsupportedScoringKeys: espn?.unsupportedScoringKeys || [],
@@ -219,13 +237,18 @@ function positionCounts(players: PlayerEvaluation[]): Record<string, number> {
   return result;
 }
 
-function matchupLine(entry: { slot: string; player: PlayerEvaluation | null }): MatchupTeamLine {
-  const player = entry.player;
-  return {
-    slot: entry.slot, playerId: player?.playerId || null, name: player?.name || 'No eligible player', positions: player?.positions || [],
-    team: player?.team || null, opponent: player?.opponent || null, weeklyPoints: player?.weeklyPoints ?? null,
-    status: player?.normalizedInjuryStatus || null, confidence: player?.confidence || 'Unavailable'
-  };
+/** Rank of each player's league-rescored projection among all projected players at the same position (1 = highest). */
+export function projectionPositionRanks(data: Map<string, ExternalPlayerData>, players: Record<string, SleeperPlayer>): Map<string, number> {
+  const byPosition = new Map<string, Array<{ id: string; points: number }>>();
+  for (const [id, entry] of data) {
+    if (entry.weeklyPoints == null) continue;
+    const position = getPositions(players[id] || { player_id: id })[0];
+    if (!position) continue;
+    byPosition.set(position, [...(byPosition.get(position) || []), { id, points: entry.weeklyPoints }]);
+  }
+  const ranks = new Map<string, number>();
+  for (const list of byPosition.values()) list.sort((a, b) => b.points - a.points).forEach((item, index) => ranks.set(item.id, index + 1));
+  return ranks;
 }
 
 function mappingDiagnostics(diagnostics: MappingDiagnostic[], relevantIds: Set<string>): { counts: { mapped: number; unmapped: number; ambiguous: number }; items: MappingDiagnostic[] } {
@@ -236,7 +259,7 @@ function mappingDiagnostics(diagnostics: MappingDiagnostic[], relevantIds: Set<s
   return { counts: { mapped: mapped.length, unmapped: unmapped.length, ambiguous: ambiguous.length }, items: relevant.slice(0, 300) };
 }
 
-function toDiagnosticStatus(outcome: SourceOutcome): SourceStatus { return { name: outcome.name, kind: outcome.kind, status: outcome.status, detail: outcome.detail, retrievedAt: outcome.retrievedAt, stale: outcome.stale }; }
+function toDiagnosticStatus(outcome: SourceOutcome): SourceStatus { return { name: outcome.name, kind: outcome.kind, status: outcome.status, detail: outcome.detail, retrievedAt: outcome.retrievedAt, sourceUpdatedAt: outcome.sourceUpdatedAt, stale: outcome.stale }; }
 
 export async function runAnalysis(config: AppConfig, progress: Progress, options: { forceRefresh?: boolean } = {}): Promise<AnalysisResult> {
   const analysisStartedAt = new Date().toISOString();
@@ -278,6 +301,7 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
   const currentStarterIds = matchupStarters.length ? matchupStarters : (myRoster.starters || []).filter(id => id && id !== '0');
   const opponentStarterIds = (opponentMatchup?.starters || []).filter(id => id && id !== '0');
   const opponentLineupIds = opponentStarterIds.length ? opponentStarterIds : (opponentRoster?.starters || []).filter(id => id && id !== '0');
+  const opponentSlotIds: Array<string | null> = (opponentMatchup?.starters?.some(id => id && id !== '0') ? opponentMatchup.starters : opponentRoster?.starters || []).map(id => id && id !== '0' ? id : null);
   weekSelection.matchupAvailable = Boolean(opponentRoster);
   weekSelection.matchupNote = opponentRoster ? null : matchupFetchError
     ? `Sleeper's Week ${targetWeek} matchup could not be loaded (${matchupFetchError}). Opponent-specific analysis is unavailable.`
@@ -321,8 +345,9 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
     const gsis = identityResult.bySleeperId.get(sleeperId)?.gsisId || player.gsis_id;
     if (gsis) supportingContext.sleeperByGsis.set(gsis, player);
   }
+  supportingContext.projectionRankBySleeperId = projectionPositionRanks(espnResult.data, catalog.players);
   const injuryOutcome = nflverse.outcomes.find(outcome => outcome.name === 'nflverse injuries');
-  const availabilityContext: AvailabilityContext = { now: new Date(), sleeperRetrievedAt: catalog.retrievedAt, sleeperStale: catalog.stale, officialRetrievedAt: injuryOutcome?.retrievedAt || null, officialStale: Boolean(injuryOutcome?.stale) };
+  const availabilityContext: AvailabilityContext = { now: new Date(), targetWeek, sleeperRetrievedAt: catalog.retrievedAt, sleeperStale: catalog.stale, officialRetrievedAt: injuryOutcome?.retrievedAt || null, officialSourceUpdatedAt: injuryOutcome?.sourceUpdatedAt || null, officialStale: Boolean(injuryOutcome?.stale) };
   const evaluate = (id: string, status: PlayerEvaluation['rosterStatus'], ownedBy: number | null) =>
     makeEvaluation(id, catalog.players[id], espnResult.data.get(id), status, ownedBy, identityResult.bySleeperId.get(id), supportingContext, newsBySleeperId.get(id) || [], availabilityContext);
 
@@ -334,20 +359,29 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
   applyReplacementValues([...myPlayers, ...freeAgents], replacementLevels);
 
   progress({ stage: 'opponent_lineup', message: 'Evaluating your opponent\'s current lineup…' });
-  const opponentPlayers = opponentRoster ? opponentLineupIds.map(id => evaluate(id, 'starter', opponentRoster.roster_id)) : [];
+  const evaluatedOpponent = new Map<string, PlayerEvaluation>();
+  if (opponentRoster) for (const id of new Set(opponentSlotIds.flatMap(id => id ? [id] : []))) evaluatedOpponent.set(id, evaluate(id, 'starter', opponentRoster.roster_id));
+  const opponentSlots = starterSlots(league.roster_positions);
+  const opponentLineup: LineupEntry[] = opponentRoster ? opponentSlots.map((slot, index) => ({ slot, player: opponentSlotIds[index] ? evaluatedOpponent.get(opponentSlotIds[index]!) || null : null, changed: false, previousPlayerId: opponentSlotIds[index] || null })) : [];
+  const opponentPlayers = opponentLineup.flatMap(entry => entry.player ? [entry.player] : []);
 
   progress({ stage: 'lineup', message: 'Solving the legal maximum-value lineup assignment…' });
   const band = decisionBand(replacementLevels);
-  const bonus = correlationBonusMap(myPlayers, opponentPlayers, band);
   const currentLineupPlayers = currentStarterIds.map(id => evaluate(id, 'starter', myRoster.roster_id));
   const currentSlots = starterSlots(league.roster_positions);
   const currentLineup = currentSlots.map((slot, index) => ({ slot, player: currentLineupPlayers[index] || null, changed: false, previousPlayerId: currentStarterIds[index] || null }));
-  const recommendedLineup = optimizeLineup(myPlayers, league.roster_positions, currentStarterIds, bonus);
+  const baselineLineup = optimizeLineup(myPlayers, league.roster_positions, currentStarterIds);
+  const baselineTotals = lineupTotals(baselineLineup);
+  const opponentTotals = lineupTotals(opponentLineup);
+  const baselineMargin = baselineTotals.expected != null && opponentTotals.expected != null ? Math.round((baselineTotals.expected - opponentTotals.expected) * 100) / 100 : null;
+  const posture: Posture | null = !opponentRoster || baselineMargin == null || baselineMargin === 0 ? null : baselineMargin > 0 ? 'FAVORITE' : 'UNDERDOG';
+  const bonus = correlationBonusMap(myPlayers, opponentPlayers, band, posture);
+  const recommendedLineup = bonus.size ? optimizeLineup(myPlayers, league.roster_positions, currentStarterIds, bonus) : baselineLineup;
   const recommendedIds = new Set(recommendedLineup.flatMap(entry => entry.player ? [entry.player.playerId] : []));
   // A correlation tiebreak only counts as applied if removing it would have changed who starts.
-  const withoutBonusIds = new Set(optimizeLineup(myPlayers, league.roster_positions, currentStarterIds).flatMap(entry => entry.player ? [entry.player.playerId] : []));
-  const tiebrokenIds = new Set([...bonus.keys()].filter(id => recommendedIds.has(id) && !withoutBonusIds.has(id)));
-  attachLineupDecisions(currentLineup, recommendedLineup, band, tiebrokenIds);
+  const tiebreaks = buildTiebreaks(recommendedLineup, baselineLineup, bonus, opponentPlayers, posture, baselineMargin, band);
+  const tiebreakText = new Map(tiebreaks.map(item => [item.chosenId, item.explanation]));
+  attachLineupDecisions(currentLineup, recommendedLineup, band, tiebreakText);
   for (const entry of recommendedLineup) {
     if (!entry.player || !entry.decision) continue;
     entry.player.reasons.unshift(entry.decision.headline);
@@ -390,14 +424,24 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
   let matchupAnalysis: MatchupAnalysis | null = null;
   if (opponentRoster) {
     const opponentOwner = users.find(user => user.user_id === opponentRoster.owner_id);
-    const opponentSlots = starterSlots(league.roster_positions);
-    const opponentLineup = opponentSlots.map((slot, index) => ({ slot, player: opponentPlayers[index] || null, changed: false, previousPlayerId: opponentLineupIds[index] || null }));
-    const opponentProjected = lineupTotal(opponentLineup);
-    const correlations: CorrelationNote[] = buildCorrelationNotes(recommendedLineup, opponentLineup, tiebrokenIds);
+    const mine = lineupTotals(recommendedLineup);
+    const theirs = opponentTotals;
+    const edges = positionEdges(recommendedLineup, opponentLineup);
+    const uncertainty = compareUncertainty(uncertaintyProfile(recommendedLineup), uncertaintyProfile(opponentLineup));
+    const myUncertainty = uncertaintyProfile(recommendedLineup);
+    const opponentUncertainty = uncertaintyProfile(opponentLineup);
     matchupAnalysis = {
-      opponentRosterId: opponentRoster.roster_id, opponentName: opponentOwner?.metadata?.team_name || opponentOwner?.display_name || `Roster ${opponentRoster.roster_id}`,
-      myProjected: totalProjected, opponentProjected, difference: totalProjected != null && opponentProjected != null ? Math.round((totalProjected - opponentProjected) * 100) / 100 : null,
-      myLineup: recommendedLineup.map(matchupLine), opponentLineup: opponentLineup.map(matchupLine), correlations
+      matchupId: myMatchup?.matchup_id ?? null, opponentRosterId: opponentRoster.roster_id, opponentName: opponentOwner?.metadata?.team_name || opponentOwner?.display_name || `Roster ${opponentRoster.roster_id}`,
+      myProjected: mine.expected, opponentProjected: theirs.expected, difference: mine.expected != null && theirs.expected != null ? Math.round((mine.expected - theirs.expected) * 100) / 100 : null,
+      totalBasis: 'Each starter counts as published projection × chance of playing (a player ruled out counts 0). Published, availability-ignoring totals are shown separately.',
+      myPublished: mine.published, opponentPublished: theirs.published, incompleteStarters: { mine: mine.missing, opponent: theirs.missing },
+      myLineup: recommendedLineup.map(matchupLine), opponentLineup: opponentLineup.map(matchupLine),
+      positionEdges: edges, largestAdvantages: largestEdges(edges, 'advantage'), largestDisadvantages: largestEdges(edges, 'disadvantage'),
+      uncertainStarters: uncertainStarters(recommendedLineup, opponentLineup),
+      uncertainty: { mine: myUncertainty, opponent: opponentUncertainty, ...uncertainty },
+      correlations: buildCorrelationNotes(recommendedLineup, opponentLineup, tiebreaks), tiebreaks,
+      waiverContext: waiverMatchupNotes([...searched.transactions, ...searched.considered], opponentPlayers),
+      winProbabilityNote: WIN_PROBABILITY_NOTE
     };
   } else warnings.push(weekSelection.matchupNote || `No Week ${targetWeek} opponent was found (bye week, playoffs, or an incomplete matchup schedule).`);
 
@@ -417,6 +461,9 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
   });
 
   const mapping = mappingDiagnostics(identityResult.diagnostics, relevantIdSet);
+  const auditIds = [...ownedIds(rosters), ...freeAgents.filter(player => player.weeklyPoints != null).map(player => player.playerId)];
+  const mappingAudit = buildMappingAudit('every rostered player in the league plus free agents that have a projection', auditIds, identityResult.bySleeperId, identityResult.diagnostics, catalog.players, id => espnResult.data.has(id), espnResult.unmatchedProjected);
+  const dataConfidence = computeDataConfidence({ outcomes, starters: recommendedLineup.flatMap(entry => entry.player ? [entry.player] : []) });
   const sleeperCache = getSleeperCacheInfo();
   const dataThroughAt = outcomes.reduce<string | null>((latest, outcome) => !outcome.retrievedAt ? latest : (!latest || outcome.retrievedAt > latest ? outcome.retrievedAt : latest), null);
   const diagnostics: AnalysisDiagnostics = {
@@ -425,10 +472,10 @@ export async function runAnalysis(config: AppConfig, progress: Progress, options
     mapped: mapping.counts.mapped, unmapped: mapping.counts.unmapped, ambiguous: mapping.counts.ambiguous,
     projectionCoverage: freeAgents.length ? Math.round(freeAgents.reduce((sum, p) => sum + (p.projectionCoverage || 0), 0) / freeAgents.length) : 0,
     unsupportedScoringKeys: [...new Set(myPlayers.flatMap(p => p.unsupportedScoringKeys || []))],
-    lastSleeperRefresh: sleeperCache.fetchedAt, mappings: mapping.items
+    lastSleeperRefresh: sleeperCache.fetchedAt, mappings: mapping.items, mappingAudit, dataConfidence
   };
   const result: AnalysisResult = {
-    id: randomUUID(), analyzedAt: new Date().toISOString(), analysisStartedAt, dataThroughAt,
+    schemaVersion: ANALYSIS_SCHEMA_VERSION, id: randomUUID(), analyzedAt: new Date().toISOString(), analysisStartedAt, dataThroughAt,
     week: targetWeek, weekSelection, season: state.season,
     league: { league_id: league.league_id, name: league.name, roster_positions: league.roster_positions, scoring_settings: league.scoring_settings },
     provider: `${sourcesSuccessful}/${sourcesAttempted} free data sources succeeded`, limitedMode: sourcesSuccessful === 0,
