@@ -1,0 +1,121 @@
+import type { NewsItem, RankingValue, SupportingDataPoint } from '../../shared/types.js';
+import { getProviderCache, putProviderCache } from '../db.js';
+import { scoreEspnProjection, type EspnStatLine } from '../engine/scoring.js';
+import { normalizeTeam } from '../services/player-mapping.js';
+import { STALE_FALLBACK_DETAIL, VOLATILE_MAX_AGE_MS } from './freshness.js';
+import type { ExternalPlayerData, SourceOutcome } from './types.js';
+
+const SOURCE = 'ESPN Fantasy';
+const TTL = VOLATILE_MAX_AGE_MS;
+
+/** ESPN's numeric pro-team IDs, stable and widely documented across open-source ESPN fantasy libraries. */
+const PRO_TEAM: Record<number, string> = {
+  1: 'ATL', 2: 'BUF', 3: 'CHI', 4: 'CIN', 5: 'CLE', 6: 'DAL', 7: 'DEN', 8: 'DET', 9: 'GB', 10: 'TEN',
+  11: 'IND', 12: 'KC', 13: 'LV', 14: 'LAR', 15: 'MIA', 16: 'MIN', 17: 'NE', 18: 'NO', 19: 'NYG', 20: 'NYJ',
+  21: 'PHI', 22: 'ARI', 23: 'PIT', 24: 'LAC', 25: 'SF', 26: 'SEA', 27: 'TB', 28: 'WAS', 29: 'CAR', 30: 'JAX',
+  33: 'BAL', 34: 'HOU'
+};
+const POSITION: Record<number, string> = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'DEF' };
+
+interface EspnStatEntry { scoringPeriodId: number; seasonId: number; statSourceId: number; stats: Record<string, number> }
+interface EspnRankEntry { rank: number; rankType: string; rankSourceId: number; slotId: number }
+interface EspnPlayerRow {
+  id: number;
+  fullName?: string;
+  proTeamId?: number;
+  defaultPositionId?: number;
+  injuryStatus?: string;
+  ownership?: { percentOwned?: number; percentStarted?: number };
+  stats?: EspnStatEntry[];
+  rankings?: Record<string, EspnRankEntry[]>;
+}
+
+async function fetchPlayers(season: string, week: number, forceRefresh: boolean): Promise<{ rows: EspnPlayerRow[]; outcome: SourceOutcome }> {
+  const cacheKey = `players:${season}:${week}`;
+  if (!forceRefresh) {
+    const hit = getProviderCache<EspnPlayerRow[]>('espn', cacheKey, TTL);
+    if (hit) return { rows: hit.value, outcome: { name: SOURCE, kind: 'projection', status: 'SUCCESS', retrievedAt: hit.retrievedAt } };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await fetch(`https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/${season}/players?scoringPeriodId=${week}&view=kona_player_info`, {
+      signal: controller.signal,
+      headers: {
+        accept: 'application/json',
+        'user-agent': 'SleeperOptimizer/1.0 (+read-only fantasy football research tool)',
+        'x-fantasy-filter': JSON.stringify({ players: { limit: 20000, sortPercOwned: { sortPriority: 1, sortAsc: false } } })
+      }
+    });
+    if (!response.ok) throw new Error(`ESPN returned HTTP ${response.status}`);
+    const rows = await response.json() as EspnPlayerRow[];
+    if (!Array.isArray(rows) || !rows.length) throw new Error('ESPN returned an empty or unexpected player list');
+    const retrievedAt = putProviderCache('espn', cacheKey, rows);
+    return { rows, outcome: { name: SOURCE, kind: 'projection', status: 'SUCCESS', retrievedAt } };
+  } catch (error) {
+    const stale = getProviderCache<EspnPlayerRow[]>('espn', cacheKey, Infinity);
+    if (stale) return { rows: stale.value, outcome: { name: SOURCE, kind: 'projection', status: 'SUCCESS', detail: STALE_FALLBACK_DETAIL, retrievedAt: stale.retrievedAt, stale: true } };
+    const timedOut = error instanceof Error && error.name === 'AbortError';
+    return { rows: [], outcome: { name: SOURCE, kind: 'projection', status: timedOut ? 'TIMEOUT' : 'BLOCKED', detail: error instanceof Error ? error.message : String(error), retrievedAt: null } };
+  } finally { clearTimeout(timer); }
+}
+
+export interface EspnResult {
+  data: Map<string, ExternalPlayerData>;
+  rankings: Map<string, RankingValue[]>;
+  news: Map<string, NewsItem[]>;
+  outcome: SourceOutcome;
+}
+
+export async function loadEspnProjections(
+  season: string, week: number, scoring: Record<string, number>, espnIdToSleeperId: Map<string, string>, forceRefresh: boolean
+): Promise<EspnResult> {
+  const { rows, outcome } = await fetchPlayers(season, week, forceRefresh);
+  const data = new Map<string, ExternalPlayerData>();
+  const rankings = new Map<string, RankingValue[]>();
+  const scoringType = (scoring.rec || 0) > 0 ? 'PPR' : 'STANDARD';
+
+  for (const row of rows) {
+    const position = POSITION[row.defaultPositionId ?? -1];
+    if (!position) continue;
+    const team = PRO_TEAM[row.proTeamId ?? -1] || null;
+    // Team defenses have no person-level identity in the crosswalk; Sleeper's own DEF player_id is the team code.
+    const sleeperId = position === 'DEF' ? (team ? normalizeTeam(team) : null) : espnIdToSleeperId.get(String(row.id));
+    if (!sleeperId) continue;
+
+    const weeklyEntry = row.stats?.find(entry => entry.scoringPeriodId === week && entry.seasonId === Number(season) && entry.statSourceId === 1);
+    let projection: ReturnType<typeof scoreEspnProjection> | null = null;
+    if (weeklyEntry) projection = scoreEspnProjection(weeklyEntry.stats as EspnStatLine, scoring, position);
+
+    const weekRanks = row.rankings?.[String(week)] || [];
+    const relevantRanks = weekRanks.filter(rank => rank.rankType === scoringType || rank.rankType === 'STANDARD');
+    if (relevantRanks.length) rankings.set(sleeperId, relevantRanks.map((rank, index) => ({ source: relevantRanks.length > 1 ? `ESPN expert panel #${rank.rankSourceId}` : SOURCE, positionRank: rank.rank, overallRank: null, scoringType: rank.rankType, retrievedAt: outcome.retrievedAt })));
+
+    const supportingData: SupportingDataPoint[] = [];
+    if (row.ownership?.percentOwned != null) supportingData.push({ label: 'ESPN ownership', value: `Rostered in ${row.ownership.percentOwned.toFixed(1)}% of ESPN leagues`, source: SOURCE });
+    if (row.ownership?.percentStarted != null) supportingData.push({ label: 'ESPN start rate', value: `Started in ${row.ownership.percentStarted.toFixed(1)}% of ESPN lineups`, source: SOURCE });
+
+    data.set(sleeperId, {
+      sleeperId,
+      externalPlayerId: String(row.id),
+      weeklyPoints: projection?.points ?? null,
+      restOfSeasonValue: null,
+      injuryStatus: row.injuryStatus && row.injuryStatus !== 'ACTIVE' ? row.injuryStatus : null,
+      opponent: null,
+      gameTime: null,
+      confidence: projection?.points != null ? (projection.coverage >= 80 ? 'High' : projection.coverage >= 50 ? 'Medium' : 'Low') : 'Low',
+      projectionCoverage: projection?.coverage ?? 0,
+      scoringComponents: projection?.components ?? [],
+      unsupportedScoringKeys: projection?.unsupportedKeys ?? [],
+      projections: projection?.points != null ? [{ source: SOURCE, points: projection.points, scoringComponents: projection.components, unsupportedScoringKeys: projection.unsupportedKeys, coverage: projection.coverage, retrievedAt: outcome.retrievedAt }] : [],
+      rankings: rankings.get(sleeperId) || [],
+      supportingData,
+      metrics: {
+        projection: { value: projection?.points ?? null, source: SOURCE },
+        coverage: { value: projection?.coverage ?? null, source: 'Sleeper scoring × ESPN statistics' },
+        ownership: { value: row.ownership?.percentOwned ?? null, source: SOURCE }
+      }
+    });
+  }
+  return { data, rankings, news: new Map(), outcome };
+}
